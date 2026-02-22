@@ -32,7 +32,9 @@ const config = {
 
   swing: {
     lookback: parseInt(process.env.SWING_LOOKBACK) || 2,
-    historySize: 50, // зберігаємо останні 50 15-хвилинних свічок
+    historySize: 50,   // зберігаємо останні 50 15m свічок
+    maxPoolSize: 8,    // зберігаємо до 8 останніх підтверджених свінгів
+    minLevelsSwept: parseInt(process.env.MIN_LEVELS_SWEPT) || 2, // мінімум рівнів для валідного sweep
   },
 
   websocket: {
