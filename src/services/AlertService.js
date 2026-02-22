@@ -65,8 +65,8 @@ class AlertService {
       return false;
     }
 
-    // Дедублікація по ключу (тип + рівень свінгу + POC)
-    const alertHash = `${type}_${data.swingLevel}_${data.poc}`;
+    // Дедублікація: хеш по (тип + набір swept рівнів)
+    const alertHash = `${type}_${data.sweptLevels.join('_')}`;
     if (this.recentAlertHashes.has(alertHash)) {
       logger.info(`[AlertService] Дублікат алерту пропущено: ${alertHash}`);
       return false;
@@ -104,18 +104,28 @@ class AlertService {
     const deltaFormatted = `${deltaSign}${data.delta.toFixed(3)} BTC`;
     const candleTime = new Date(data.candle.openTime).toUTCString();
 
+    // Список пробитих рівнів (від нижнього до верхнього)
+    const levelsStr = data.sweptLevels
+      .slice()
+      .sort((a, b) => a - b)
+      .map(p => `<code>${p}</code>`)
+      .join(' → ');
+
     return (
       `⚠️ <b>BTCUSDT 1M – SHORT Absorption Detected</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `🔺 <b>Liquidity Sweep:</b> Previous 15m Swing High taken at <code>${data.swingLevel}</code>\n` +
+      `🔺 <b>Liquidity Sweep:</b> Знято <b>${data.sweptCount} хаїв</b> одним рухом\n` +
+      `📍 <b>Рівні:</b> ${levelsStr}\n` +
+      `📌 <b>Sweep до:</b> <code>${data.sweepPrice}</code>\n` +
       `⚡ <b>Delta Spike:</b> <code>${deltaFormatted}</code> (${data.deltaMultiple}x avg)\n` +
-      `📊 <b>Volume Spike:</b> <code>${data.volumeMultiple}x</code> average (${data.totalVolume.toFixed(2)} BTC)\n` +
+      `📊 <b>Volume Spike:</b> <code>${data.volumeMultiple}x</code> avg (${data.totalVolume.toFixed(2)} BTC)\n` +
       `🎯 <b>POC:</b> <code>${data.poc}</code>\n` +
-      `📉 <b>Close:</b> <code>${data.candleClose}</code> <i>(below POC ✓)</i>\n` +
-      `✅ <b>Follow-up:</b> No continuation higher\n` +
+      `📉 <b>Close:</b> <code>${data.candleClose}</code> <i>(нижче POC ✓)</i>\n` +
+      `✅ <b>Підтвердження:</b> Немає продовження вгору\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `💡 <i>Interpretation: Aggressive buyers were absorbed by passive sellers.</i>\n` +
-      `🔴 <b>Potential SHORT reversal setup.</b>\n` +
+      `💡 <i>Агресивні покупці поглинуті пасивними продавцями.\n` +
+      `Знято ліквідність одразу з ${data.sweptCount} рівнів.</i>\n` +
+      `🔴 <b>Potential SHORT reversal.</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━\n` +
       `🕐 ${candleTime}`
     );
@@ -126,18 +136,28 @@ class AlertService {
     const deltaFormatted = `${deltaSign}${data.delta.toFixed(3)} BTC`;
     const candleTime = new Date(data.candle.openTime).toUTCString();
 
+    // Список пробитих рівнів (від нижнього до верхнього)
+    const levelsStr = data.sweptLevels
+      .slice()
+      .sort((a, b) => a - b)
+      .map(p => `<code>${p}</code>`)
+      .join(' → ');
+
     return (
       `✅ <b>BTCUSDT 1M – LONG Absorption Detected</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `🔻 <b>Liquidity Sweep:</b> Previous 15m Swing Low taken at <code>${data.swingLevel}</code>\n` +
+      `🔻 <b>Liquidity Sweep:</b> Знято <b>${data.sweptCount} лоїв</b> одним рухом\n` +
+      `📍 <b>Рівні:</b> ${levelsStr}\n` +
+      `📌 <b>Sweep до:</b> <code>${data.sweepPrice}</code>\n` +
       `⚡ <b>Delta Spike:</b> <code>${deltaFormatted}</code> (${data.deltaMultiple}x avg)\n` +
-      `📊 <b>Volume Spike:</b> <code>${data.volumeMultiple}x</code> average (${data.totalVolume.toFixed(2)} BTC)\n` +
+      `📊 <b>Volume Spike:</b> <code>${data.volumeMultiple}x</code> avg (${data.totalVolume.toFixed(2)} BTC)\n` +
       `🎯 <b>POC:</b> <code>${data.poc}</code>\n` +
-      `📈 <b>Close:</b> <code>${data.candleClose}</code> <i>(above POC ✓)</i>\n` +
-      `✅ <b>Follow-up:</b> No continuation lower\n` +
+      `📈 <b>Close:</b> <code>${data.candleClose}</code> <i>(вище POC ✓)</i>\n` +
+      `✅ <b>Підтвердження:</b> Немає продовження вниз\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `💡 <i>Interpretation: Aggressive sellers were absorbed by passive buyers.</i>\n` +
-      `🟢 <b>Potential LONG reversal setup.</b>\n` +
+      `💡 <i>Агресивні продавці поглинуті пасивними покупцями.\n` +
+      `Знято ліквідність одразу з ${data.sweptCount} рівнів.</i>\n` +
+      `🟢 <b>Potential LONG reversal.</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━\n` +
       `🕐 ${candleTime}`
     );

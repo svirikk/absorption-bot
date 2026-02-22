@@ -161,7 +161,7 @@ class Bot {
     // 1. Отримуємо footprint для цієї свічки
     const footprint = this.footprintEngine.calculate();
 
-    // 2. Оновлюємо ковзну статистику (для наступних свічок)
+    // 2. Оновлюємо ковзну статистику
     if (footprint) {
       this.absorptionDetector.updateStats(footprint.totalVolume, footprint.delta);
     }
@@ -183,18 +183,26 @@ class Bot {
 
     // 4. Перевіряємо нову свічку на кандидата абсорбції
     if (footprint) {
-      const swingHigh = this.swingDetector.getSwingHigh();
-      const swingLow = this.swingDetector.getSwingLow();
+      // Отримуємо які рівні з пулу були пробиті цією свічкою
+      const sweptLows  = this.swingDetector.getSweptLows(candle.low);
+      const sweptHighs = this.swingDetector.getSweptHighs(candle.high);
+
+      if (sweptLows.count > 0 || sweptHighs.count > 0) {
+        logger.debug(
+          `[Bot] Sweep: ${sweptHighs.count} хаїв [${sweptHighs.swept.map(s=>s.price).join(',')}], ` +
+          `${sweptLows.count} лоїв [${sweptLows.swept.map(s=>s.price).join(',')}]`
+        );
+      }
 
       const candidate = this.absorptionDetector.checkCandle(
         candle,
         footprint,
-        swingHigh,
-        swingLow,
+        sweptLows,
+        sweptHighs,
       );
 
+      // checkCandle повертає type тільки якщо щось підтверджено одразу (не використовується зараз)
       if (candidate.type) {
-        // Це не має статися (checkCandle не повертає type напряму)
         await this._handleAbsorptionConfirmed(candidate);
       }
     }
@@ -209,7 +217,7 @@ class Bot {
 
   async _handleAbsorptionConfirmed(result) {
     const { type, data } = result;
-    logger.info(`[Bot] 🚨 ${type} Абсорбція підтверджена! Swing: ${data.swingLevel}, POC: ${data.poc}`);
+    logger.info(`[Bot] 🚨 ${type} Абсорбція підтверджена! Знято ${data.sweptCount} рівнів: [${data.sweptLevels.join(', ')}]`);
 
     let sent = false;
     if (type === 'SHORT') {
@@ -220,6 +228,12 @@ class Bot {
 
     if (sent) {
       logger.info(`[Bot] ✅ Telegram алерт надіслано`);
+      // Очищаємо swept рівні з пулу щоб не тригерити повторно по тим самим рівням
+      if (type === 'SHORT' && data.sweptHighsInfo) {
+        this.swingDetector.clearSweptLevels('high', data.sweptHighsInfo.swept);
+      } else if (type === 'LONG' && data.sweptLowsInfo) {
+        this.swingDetector.clearSweptLevels('low', data.sweptLowsInfo.swept);
+      }
     } else {
       logger.warn(`[Bot] ⚠️ Алерт не надісланий (cooldown або дублікат)`);
     }
