@@ -1,128 +1,110 @@
 /**
  * detectors/AbsorptionDetector.js
- * Основна логіка детектування абсорбції ліквідності.
  *
- * Зберігає стан попередніх свічок для перевірки умов:
- * - liquidity sweep
- * - delta spike
- * - volume spike
- * - закриття відносно POC
- * - відсутність продовження після свічки
- * - підтвердження виснаження (наступні 1-2 свічки)
+ * Логіка абсорбції з перевіркою ПУЛУ ліквідності.
+ *
+ * Тепер вимагаємо що свічка пробила МІНІМУМ minLevelsSwept рівнів —
+ * тобто знялась ліквідність з кількох swing точок одночасно.
+ * Це фільтрує слабкі локальні sweep одного рівня.
  */
 
 const { config } = require('../config');
 const RollingStats = require('../utils/rollingStats');
 const logger = require('../utils/logger');
 
-// Стан підозрілої свічки (очікуємо підтвердження)
 const PendingState = {
-  NONE: 'NONE',
-  SHORT: 'SHORT_PENDING',  // шукаємо підтвердження short абсорбції
-  LONG: 'LONG_PENDING',    // шукаємо підтвердження long абсорбції
+  NONE:  'NONE',
+  SHORT: 'SHORT_PENDING',
+  LONG:  'LONG_PENDING',
 };
 
 class AbsorptionDetector {
   constructor() {
     this.stats = new RollingStats(config.alert.rollingWindow);
+    this.minLevelsSwept = config.swing.minLevelsSwept; // мін. рівнів для валідного sweep
 
-    // Підозріла свічка, що очікує підтвердження
-    this.pending = {
-      state: PendingState.NONE,
-      candle: null,       // сама підозріла свічка
-      footprint: null,    // її footprint
-      swingLevel: null,   // рівень свінгу, що був пробитий
-      sweepHigh: null,    // ціна sweep high
-      sweepLow: null,     // ціна sweep low
-      confirmCount: 0,    // скільки свічок вже перевірено
-    };
-
-    this.maxConfirmCandles = 2; // скільки свічок чекаємо підтвердження
+    this.pending = this._emptyPending();
+    this.maxConfirmCandles = 2;
   }
 
-  /**
-   * Оновлює ковзну статистику закритою свічкою
-   * @param {number} totalVolume
-   * @param {number} delta
-   */
   updateStats(totalVolume, delta) {
     this.stats.push(totalVolume, delta);
   }
 
   /**
-   * Перевіряє чи підозріла свічка є initial sweep+absorption кандидатом
+   * Перевіряє свічку на кандидата абсорбції.
    *
-   * @param {Object} candle     - закрита 1m свічка
-   * @param {Object} footprint  - розрахований footprint для цієї свічки
-   * @param {Object} swingHigh  - { price } або null
-   * @param {Object} swingLow   - { price } або null
-   * @returns {{ type: 'SHORT'|'LONG'|null, data: Object }}
+   * @param {Object} candle
+   * @param {Object} footprint
+   * @param {{ swept, count, highestSweptLevel, deepestLevel }} sweptLows  - від SwingDetector
+   * @param {{ swept, count, lowestSweptLevel, highestLevel }}  sweptHighs - від SwingDetector
+   * @returns {{ type: null }}  — завжди null тут (підтвердження через наступну свічку)
    */
-  checkCandle(candle, footprint, swingHigh, swingLow) {
-    if (!footprint || !this.stats.isReady) {
-      return { type: null };
-    }
+  checkCandle(candle, footprint, sweptLows, sweptHighs) {
+    if (!footprint || !this.stats.isReady) return { type: null };
 
-    const avgVol = this.stats.avgVolume;
+    const avgVol      = this.stats.avgVolume;
     const avgAbsDelta = this.stats.avgAbsDelta;
 
-    logger.debug(
-      `[AbsorptionDetector] Перевірка свічки: vol=${footprint.totalVolume.toFixed(2)}, ` +
-      `delta=${footprint.delta.toFixed(2)}, poc=${footprint.poc}, close=${candle.close} | ` +
-      `avgVol=${avgVol.toFixed(2)}, avgAbsDelta=${avgAbsDelta.toFixed(2)}`
-    );
-
-    // ─── SHORT Absorption Candidate ─────────────────────────────────────────
-    if (swingHigh && candle.high > swingHigh.price) {
-      const deltaSpike = footprint.delta > avgAbsDelta * config.alert.deltaMultiplier;
-      const volSpike = footprint.totalVolume > avgVol * config.alert.volumeMultiplier;
+    // ─── SHORT: свічка пробила кілька swing highs ──────────────────────────
+    if (sweptHighs.count >= this.minLevelsSwept) {
+      const deltaSpike   = footprint.delta > avgAbsDelta * config.alert.deltaMultiplier;
+      const volSpike     = footprint.totalVolume > avgVol * config.alert.volumeMultiplier;
       const closeBelowPOC = candle.close < footprint.poc;
 
       logger.debug(
-        `[AbsorptionDetector] SHORT кандидат: sweep=${candle.high > swingHigh.price}, ` +
-        `deltaSpike=${deltaSpike}(${footprint.delta.toFixed(2)} > ${(avgAbsDelta * config.alert.deltaMultiplier).toFixed(2)}), ` +
-        `volSpike=${volSpike}, closeBelowPOC=${closeBelowPOC}`
+        `[AbsorptionDetector] SHORT кандидат: swept=${sweptHighs.count} хаїв, ` +
+        `delta=${footprint.delta.toFixed(2)} (потрібно >${(avgAbsDelta * config.alert.deltaMultiplier).toFixed(2)}), ` +
+        `vol=${footprint.totalVolume.toFixed(2)} (потрібно >${(avgVol * config.alert.volumeMultiplier).toFixed(2)}), ` +
+        `closeBelowPOC=${closeBelowPOC}`
       );
 
       if (deltaSpike && volSpike && closeBelowPOC) {
-        logger.info(`[AbsorptionDetector] 🟡 SHORT кандидат виявлено, очікуємо підтвердження...`);
+        logger.info(
+          `[AbsorptionDetector] 🟡 SHORT кандидат: знято ${sweptHighs.count} рівнів хаїв ` +
+          `[${sweptHighs.swept.map(s => s.price).join(', ')}]`
+        );
         this.pending = {
-          state: PendingState.SHORT,
+          state:       PendingState.SHORT,
           candle,
           footprint,
-          swingLevel: swingHigh.price,
-          sweepHigh: candle.high,
-          sweepLow: null,
+          sweptHighs,
+          sweptLows:   null,
+          sweepPrice:  candle.high,
           confirmCount: 0,
         };
-        return { type: null }; // ще не підтверджено
+        return { type: null };
       }
     }
 
-    // ─── LONG Absorption Candidate ──────────────────────────────────────────
-    if (swingLow && candle.low < swingLow.price) {
-      const deltaSpike = footprint.delta < -(avgAbsDelta * config.alert.deltaMultiplier);
-      const volSpike = footprint.totalVolume > avgVol * config.alert.volumeMultiplier;
+    // ─── LONG: свічка пробила кілька swing lows ────────────────────────────
+    if (sweptLows.count >= this.minLevelsSwept) {
+      const deltaSpike    = footprint.delta < -(avgAbsDelta * config.alert.deltaMultiplier);
+      const volSpike      = footprint.totalVolume > avgVol * config.alert.volumeMultiplier;
       const closeAbovePOC = candle.close > footprint.poc;
 
       logger.debug(
-        `[AbsorptionDetector] LONG кандидат: sweep=${candle.low < swingLow.price}, ` +
-        `deltaSpike=${deltaSpike}(${footprint.delta.toFixed(2)} < ${-(avgAbsDelta * config.alert.deltaMultiplier).toFixed(2)}), ` +
-        `volSpike=${volSpike}, closeAbovePOC=${closeAbovePOC}`
+        `[AbsorptionDetector] LONG кандидат: swept=${sweptLows.count} лоїв, ` +
+        `delta=${footprint.delta.toFixed(2)} (потрібно <${-(avgAbsDelta * config.alert.deltaMultiplier).toFixed(2)}), ` +
+        `vol=${footprint.totalVolume.toFixed(2)} (потрібно >${(avgVol * config.alert.volumeMultiplier).toFixed(2)}), ` +
+        `closeAbovePOC=${closeAbovePOC}`
       );
 
       if (deltaSpike && volSpike && closeAbovePOC) {
-        logger.info(`[AbsorptionDetector] 🟡 LONG кандидат виявлено, очікуємо підтвердження...`);
+        logger.info(
+          `[AbsorptionDetector] 🟡 LONG кандидат: знято ${sweptLows.count} рівнів лоїв ` +
+          `[${sweptLows.swept.map(s => s.price).join(', ')}]`
+        );
         this.pending = {
-          state: PendingState.LONG,
+          state:       PendingState.LONG,
           candle,
           footprint,
-          swingLevel: swingLow.price,
-          sweepHigh: null,
-          sweepLow: candle.low,
+          sweptLows,
+          sweptHighs:  null,
+          sweepPrice:  candle.low,
           confirmCount: 0,
         };
-        return { type: null }; // ще не підтверджено
+        return { type: null };
       }
     }
 
@@ -130,114 +112,96 @@ class AbsorptionDetector {
   }
 
   /**
-   * Перевіряє підтвердження для pending кандидата наступними свічками.
-   * Виклик після кожної свічки що йде після кандидата.
-   *
-   * @param {Object} candle    - нова закрита свічка (наступна після кандидата)
-   * @param {Object} footprint - її footprint
-   * @returns {{ type: 'SHORT'|'LONG'|null, data: Object }}
+   * Перевіряє підтвердження наступною свічкою.
    */
   checkConfirmation(candle, footprint) {
-    if (this.pending.state === PendingState.NONE) {
-      return { type: null };
-    }
+    if (this.pending.state === PendingState.NONE) return { type: null };
 
     this.pending.confirmCount++;
-    const avgVol = this.stats.avgVolume;
-    const avgAbsDelta = this.stats.avgAbsDelta;
 
-    // ─── SHORT Підтвердження ─────────────────────────────────────────────────
+    // ─── SHORT підтвердження ──────────────────────────────────────────────
     if (this.pending.state === PendingState.SHORT) {
-      // Умова: свічка НЕ оновлює sweep high
-      const noHigherHigh = candle.high <= this.pending.sweepHigh;
-
-      // Виснаження: обʼєм знижується, дельта нормалізується
-      const volumeDropped = footprint
-        ? footprint.totalVolume < avgVol * config.alert.exhaustionVolumeDropRatio
-        : false;
-      const deltaNormalized = footprint
-        ? Math.abs(footprint.delta) < avgAbsDelta * config.alert.exhaustionDeltaNormalizeRatio
-        : false;
-
-      if (noHigherHigh) {
-        // Базове підтвердження — достатньо
-        const result = this._buildResult('SHORT');
-        this._clearPending();
-        return result;
-      }
-
-      // Якщо оновив high — кандидат провалився
-      if (candle.high > this.pending.sweepHigh) {
-        logger.info(`[AbsorptionDetector] SHORT кандидат скасовано: нове HH ${candle.high} > ${this.pending.sweepHigh}`);
+      if (candle.high > this.pending.sweepPrice) {
+        logger.info(`[AbsorptionDetector] SHORT скасовано: нове HH ${candle.high}`);
         this._clearPending();
         return { type: null };
       }
+      // Не оновив high → підтверджено
+      const result = this._buildResult('SHORT');
+      this._clearPending();
+      return result;
     }
 
-    // ─── LONG Підтвердження ──────────────────────────────────────────────────
+    // ─── LONG підтвердження ───────────────────────────────────────────────
     if (this.pending.state === PendingState.LONG) {
-      const noLowerLow = candle.low >= this.pending.sweepLow;
-
-      if (noLowerLow) {
-        const result = this._buildResult('LONG');
-        this._clearPending();
-        return result;
-      }
-
-      if (candle.low < this.pending.sweepLow) {
-        logger.info(`[AbsorptionDetector] LONG кандидат скасовано: нове LL ${candle.low} < ${this.pending.sweepLow}`);
+      if (candle.low < this.pending.sweepPrice) {
+        logger.info(`[AbsorptionDetector] LONG скасовано: нове LL ${candle.low}`);
         this._clearPending();
         return { type: null };
       }
+      const result = this._buildResult('LONG');
+      this._clearPending();
+      return result;
     }
 
-    // Якщо вичерпали maxConfirmCandles — скасовуємо
     if (this.pending.confirmCount >= this.maxConfirmCandles) {
-      logger.info(`[AbsorptionDetector] Кандидат скасовано: вичерпано ${this.maxConfirmCandles} свічки підтвердження`);
+      logger.info(`[AbsorptionDetector] Кандидат скасовано: вичерпано ліміт свічок`);
       this._clearPending();
     }
 
     return { type: null };
   }
 
-  /**
-   * Чи є поточний pending кандидат
-   */
   hasPending() {
     return this.pending.state !== PendingState.NONE;
   }
 
-  // ─── Приватні методи ────────────────────────────────────────────────────────
+  // ─── Приватне ─────────────────────────────────────────────────────────────
 
   _buildResult(type) {
     const p = this.pending;
+    const sweptInfo = type === 'SHORT' ? p.sweptHighs : p.sweptLows;
+
     return {
       type,
       data: {
-        swingLevel: p.swingLevel,
-        sweepPrice: type === 'SHORT' ? p.sweepHigh : p.sweepLow,
-        delta: p.footprint.delta,
-        totalVolume: p.footprint.totalVolume,
-        avgVolume: this.stats.avgVolume,
-        avgAbsDelta: this.stats.avgAbsDelta,
-        poc: p.footprint.poc,
-        candleClose: p.candle.close,
+        // Пул рівнів що були swept
+        sweptLevels:    sweptInfo.swept.map(s => s.price).sort((a, b) => a - b),
+        sweptCount:     sweptInfo.count,
+        // Найвищий swept рівень (для SHORT) або найнижчий (для LONG)
+        swingLevel: type === 'SHORT'
+          ? sweptInfo.highestLevel
+          : sweptInfo.highestSweptLevel,
+        sweepPrice:     p.sweepPrice,
+        delta:          p.footprint.delta,
+        totalVolume:    p.footprint.totalVolume,
+        avgVolume:      this.stats.avgVolume,
+        avgAbsDelta:    this.stats.avgAbsDelta,
+        poc:            p.footprint.poc,
+        candleClose:    p.candle.close,
         volumeMultiple: (p.footprint.totalVolume / this.stats.avgVolume).toFixed(2),
-        deltaMultiple: (Math.abs(p.footprint.delta) / this.stats.avgAbsDelta).toFixed(2),
-        candle: p.candle,
-        footprint: p.footprint,
+        deltaMultiple:  (Math.abs(p.footprint.delta) / this.stats.avgAbsDelta).toFixed(2),
+        candle:         p.candle,
+        footprint:      p.footprint,
+        // Для очищення пулу після алерту
+        sweptLowsInfo:  p.sweptLows,
+        sweptHighsInfo: p.sweptHighs,
       },
     };
   }
 
   _clearPending() {
-    this.pending = {
-      state: PendingState.NONE,
-      candle: null,
-      footprint: null,
-      swingLevel: null,
-      sweepHigh: null,
-      sweepLow: null,
+    this.pending = this._emptyPending();
+  }
+
+  _emptyPending() {
+    return {
+      state:        PendingState.NONE,
+      candle:       null,
+      footprint:    null,
+      sweptLows:    null,
+      sweptHighs:   null,
+      sweepPrice:   null,
       confirmCount: 0,
     };
   }

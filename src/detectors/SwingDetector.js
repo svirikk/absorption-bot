@@ -1,12 +1,16 @@
 /**
  * detectors/SwingDetector.js
- * Визначає swing high та swing low з 15m свічок.
  *
- * Swing High: high > highs сусідніх N свічок ліворуч і праворуч
- * Swing Low:  low  < lows  сусідніх N свічок ліворуч і праворуч
+ * Відстежує СЕРІЮ підтверджених swing high і swing low на 15m.
+ * Замість одного рівня — зберігаємо пул ліквідності:
  *
- * Оскільки ми не знаємо майбутніх свічок у реальному часі,
- * свінг підтверджується коли пройшло N свічок після кандидата.
+ * Ascending lows (LONG liquidity pool):
+ *   Low1 < Low2 < Low3 < Low4  → сходинки вгору → стопи під кожним
+ *   Коли ціна одним рухом пробиває кілька → масове зняття ліквідності
+ *
+ * Descending highs (SHORT liquidity pool):
+ *   High1 > High2 > High3 > High4  → сходинки вниз → стопи над кожним
+ *   Коли ціна одним рухом пробиває кілька → масове зняття ліквідності
  */
 
 const { config } = require('../config');
@@ -14,101 +18,123 @@ const logger = require('../utils/logger');
 
 class SwingDetector {
   constructor() {
-    this.lookback = config.swing.lookback; // N = 2
+    this.lookback    = config.swing.lookback;     // N свічок ліво/право
+    this.maxPoolSize = config.swing.maxPoolSize;  // макс рівнів у пулі
 
-    // Остання підтверджена swing high / low
-    this.latestSwingHigh = null; // { price, time, index }
-    this.latestSwingLow = null;  // { price, time, index }
-
-    // Черга кандидатів на перевірку
-    // Кандидат підтверджується через N свічок
-    this.highCandidates = [];
-    this.lowCandidates = [];
+    // Масиви підтверджених свінгів (від старого до нового)
+    // Кожен: { price, time, idx }
+    this.swingHighPool = [];
+    this.swingLowPool  = [];
   }
 
   /**
-   * Викликається при закритті нової 15m свічки
-   * @param {Object[]} candles15m - масив усіх закритих 15m свічок
+   * Оновлює пули при закритті нової 15m свічки.
+   * @param {Object[]} candles15m
    */
   update(candles15m) {
     const len = candles15m.length;
-    if (len < this.lookback * 2 + 1) return; // недостатньо даних
+    if (len < this.lookback * 2 + 1) return;
 
-    // Перевіряємо свічку на позиції (len - 1 - lookback)
-    // тобто свічку, яка має lookback свічок праворуч
     const idx = len - 1 - this.lookback;
     if (idx < this.lookback) return;
 
     const candidate = candles15m[idx];
 
-    // ─── Перевірка Swing High ───────────────────────────────────────────────
-    let isSwingHigh = true;
-    for (let i = 1; i <= this.lookback; i++) {
-      if (candles15m[idx - i].high >= candidate.high ||
-          candles15m[idx + i].high >= candidate.high) {
-        isSwingHigh = false;
-        break;
+    const alreadyHigh = this.swingHighPool.some(s => s.time === candidate.openTime);
+    const alreadyLow  = this.swingLowPool.some(s => s.time === candidate.openTime);
+
+    // ─── Swing High ───────────────────────────────────────────────────────────
+    if (!alreadyHigh) {
+      let isSwingHigh = true;
+      for (let i = 1; i <= this.lookback; i++) {
+        if (candles15m[idx - i].high >= candidate.high ||
+            candles15m[idx + i].high >= candidate.high) {
+          isSwingHigh = false;
+          break;
+        }
+      }
+      if (isSwingHigh) {
+        this._addToPool(this.swingHighPool, { price: candidate.high, time: candidate.openTime, idx });
+        logger.info(
+          `[SwingDetector] 🔺 Swing High: ${candidate.high} | ` +
+          `Пул: [${this.swingHighPool.map(s => s.price).join(', ')}]`
+        );
       }
     }
 
-    if (isSwingHigh) {
-      // Оновлюємо лише якщо це новий рівень (не повтор)
-      if (!this.latestSwingHigh || this.latestSwingHigh.time !== candidate.openTime) {
-        const prev = this.latestSwingHigh;
-        this.latestSwingHigh = {
-          price: candidate.high,
-          time: candidate.openTime,
-          idx,
-        };
-        logger.info(`[SwingDetector] 🔺 Новий Swing High: ${candidate.high} (попередній: ${prev?.price ?? 'немає'})`);
+    // ─── Swing Low ────────────────────────────────────────────────────────────
+    if (!alreadyLow) {
+      let isSwingLow = true;
+      for (let i = 1; i <= this.lookback; i++) {
+        if (candles15m[idx - i].low <= candidate.low ||
+            candles15m[idx + i].low <= candidate.low) {
+          isSwingLow = false;
+          break;
+        }
       }
-    }
-
-    // ─── Перевірка Swing Low ────────────────────────────────────────────────
-    let isSwingLow = true;
-    for (let i = 1; i <= this.lookback; i++) {
-      if (candles15m[idx - i].low <= candidate.low ||
-          candles15m[idx + i].low <= candidate.low) {
-        isSwingLow = false;
-        break;
-      }
-    }
-
-    if (isSwingLow) {
-      if (!this.latestSwingLow || this.latestSwingLow.time !== candidate.openTime) {
-        const prev = this.latestSwingLow;
-        this.latestSwingLow = {
-          price: candidate.low,
-          time: candidate.openTime,
-          idx,
-        };
-        logger.info(`[SwingDetector] 🔻 Новий Swing Low: ${candidate.low} (попередній: ${prev?.price ?? 'немає'})`);
+      if (isSwingLow) {
+        this._addToPool(this.swingLowPool, { price: candidate.low, time: candidate.openTime, idx });
+        logger.info(
+          `[SwingDetector] 🔻 Swing Low: ${candidate.low} | ` +
+          `Пул: [${this.swingLowPool.map(s => s.price).join(', ')}]`
+        );
       }
     }
   }
 
   /**
-   * Повертає поточний swing high рівень або null
+   * Повертає всі swing low що були ПРОБИТІ (candleLow < swingLow.price).
+   * @param {number} candleLow
    */
-  getSwingHigh() {
-    return this.latestSwingHigh;
+  getSweptLows(candleLow) {
+    const swept = this.swingLowPool.filter(s => candleLow < s.price);
+    return {
+      swept,
+      count: swept.length,
+      highestSweptLevel: swept.length > 0 ? Math.max(...swept.map(s => s.price)) : null,
+      deepestLevel:      swept.length > 0 ? Math.min(...swept.map(s => s.price)) : null,
+    };
   }
 
   /**
-   * Повертає поточний swing low рівень або null
+   * Повертає всі swing high що були ПРОБИТІ (candleHigh > swingHigh.price).
+   * @param {number} candleHigh
    */
-  getSwingLow() {
-    return this.latestSwingLow;
+  getSweptHighs(candleHigh) {
+    const swept = this.swingHighPool.filter(s => candleHigh > s.price);
+    return {
+      swept,
+      count: swept.length,
+      lowestSweptLevel: swept.length > 0 ? Math.min(...swept.map(s => s.price)) : null,
+      highestLevel:     swept.length > 0 ? Math.max(...swept.map(s => s.price)) : null,
+    };
   }
 
   /**
-   * Повертає стан детектора для логування
+   * Видаляє swept рівні з пулу після підтвердженого алерту.
+   * @param {'high'|'low'} type
+   * @param {Object[]} sweptLevels
    */
+  clearSweptLevels(type, sweptLevels) {
+    const sweptTimes = new Set(sweptLevels.map(s => s.time));
+    if (type === 'high') {
+      this.swingHighPool = this.swingHighPool.filter(s => !sweptTimes.has(s.time));
+    } else {
+      this.swingLowPool = this.swingLowPool.filter(s => !sweptTimes.has(s.time));
+    }
+  }
+
   getStatus() {
     return {
-      swingHigh: this.latestSwingHigh?.price ?? null,
-      swingLow: this.latestSwingLow?.price ?? null,
+      swingHighs: this.swingHighPool.map(s => s.price),
+      swingLows:  this.swingLowPool.map(s => s.price),
     };
+  }
+
+  _addToPool(pool, entry) {
+    pool.push(entry);
+    pool.sort((a, b) => a.time - b.time);
+    while (pool.length > this.maxPoolSize) pool.shift();
   }
 }
 
